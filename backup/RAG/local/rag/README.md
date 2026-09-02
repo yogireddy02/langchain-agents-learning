@@ -16,7 +16,7 @@ pip install -r requirements.txt
 export OPENAI_API_KEY=sk-...
 export PINECONE_API_KEY=pc-...
 
-jupyter lab 01_ingestion.ipynb
+jupyter lab 01_ingestion_practice.ipynb
 ```
 
 Put your PDFs in a `pdfs/` folder next to the notebooks.
