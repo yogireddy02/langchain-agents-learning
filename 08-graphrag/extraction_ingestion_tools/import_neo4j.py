@@ -68,7 +68,7 @@ def driver():
     from neo4j import GraphDatabase
 
     uri = os.environ.get("NEO4J_URI", "")
-    user = os.environ.get("NEO4J_USER", "neo4j")
+    user = os.environ.get("NEO4J_USER", "")
     password = os.environ.get("NEO4J_PASSWORD", "")
 
     if not password:
