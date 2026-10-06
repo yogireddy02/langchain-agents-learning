@@ -2,12 +2,14 @@
 """One-click setup for trial_search.
 
     python deploy.py --pinecone-index rag-docs
+    python deploy.py --image <you>/trial-search-agent:1.0     copy a prebuilt image from Docker Hub (NO Docker)
+    python deploy.py --publish <you>/trial-search-agent:1.0   instructor: build + push to Docker Hub, then stop
 
     STEP 1   secrets      trial-search/pinecone, trial-search/cohere,
                           trial-agents/openai (placeholders if new);
                           trial-graph/neo4j must exist — owned by trial_graph
     STEP 2   Lambda role  read those four secrets
-    STEP 3   Lambda       semantic_search, expand_neighbors, expand_table
+    STEP 3   Lambda       resolve_trial, semantic_search, expand_neighbors, expand_table
     STEP 4   Gateway      AWS_IAM (SigV4); target created or updated
     STEP 5   guardrail    shared; a new version only if the policy changed
     STEP 6   prompt       prompts/system.md -> Prompt Management; version only on change
@@ -29,6 +31,9 @@ Before STEP 1, CloudWatch Transaction Search is enabled if it is not already —
 without it, no agent's spans appear in CloudWatch (infra/observability.py).
 
 DEPLOY ORDER:  trial_graph -> trial_search -> supervisor
+
+resolve_trial reads the Neo4j fulltext index trial_entity_names. It is created
+by trial_graph/setup_neo4j.py — run that once before this deploy.
 """
 import argparse
 import json
@@ -47,13 +52,17 @@ PINECONE_SECRET = "trial-search/pinecone"
 COHERE_SECRET = "trial-search/cohere"
 RERANK_POOL = 40
 NEO4J_SECRET = "trial-graph/neo4j"          # owned by trial_graph
-DESCRIPTION = ("What the 20 trial protocols actually say: eligibility wording, study "
+# Read by the supervisor's routing model (rendered into its AVAILABLE AGENTS).
+# It describes a capability, not the corpus: no trial names or counts, so it
+# never goes stale when protocols are added.
+DESCRIPTION = ("What the trial protocols actually say: eligibility wording, study "
                "design, endpoint definitions, dosing, safety and adverse event sections, "
                "and the values inside protocol tables. Answers by retrieving passages. "
-               "Knows each protocol by NCT number, acronym (IMbrave150, STEP 1, "
-               "PIONEER 4, ENSEMBLE 2 ...) and drug and condition, and narrows to it "
-               "itself. Does not know sponsors, sites or other registry facts.")
-BUDGETS = {"max_searches_per_turn": 5, "max_neighbor_calls": 3, "max_table_calls": 3,
+               "Resolves a trial named in the question — NCT number, acronym, title "
+               "words, drug or condition — to its protocol itself, through the "
+               "registry graph's name index. Does not answer sponsor, site, phase or "
+               "other registry questions.")
+BUDGETS = {"max_resolve_calls": 3, "max_searches_per_turn": 5, "max_neighbor_calls": 3, "max_table_calls": 3,
            "max_window": 10, "expansion_token_budget": 6000}
 
 
@@ -68,8 +77,22 @@ def _require(name: str, owner: str) -> str:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--pinecone-index", default="rag-docs")
+    ap.add_argument("--image", help="Docker Hub image to deploy, e.g. <you>/trial-search-agent:1.0 "
+                                    "(no Docker needed: copied into ECR over HTTPS)")
+    ap.add_argument("--publish", help="instructor: build linux/arm64, push to this Docker Hub "
+                                      "image, and stop")
     args = ap.parse_args()
-    preflight.run(needs_gateway=True)
+    if args.publish:
+        # Publishing needs Docker and a `docker login` to Docker Hub — no AWS
+        # resource is created or changed.
+        from infra import image_copy
+        print("=== preflight ===")
+        preflight.check_docker()
+        image_copy.publish(args.publish, str(HERE / "agent_code"))
+        print(f"\npublished {args.publish} — students deploy it with: "
+              f"python deploy.py --image {args.publish}")
+        return
+    preflight.run(needs_gateway=True, needs_docker=not args.image)
     prefix = config_store.prefix(AGENT)
 
     print("=== observability: CloudWatch Transaction Search (once per account) ===")
@@ -118,7 +141,11 @@ def main() -> None:
     role_arn = runtime_iam.runtime_role(
         gateway_arn=gw["gatewayArn"], ecr_repo_arn=repo_arn, guardrail_arn=gr["arn"],
         prompt_arns=[prompt["arn"]], secret_arn=openai_arn, param_prefix=prefix)
-    image_uri = runtime_deploy.build_and_push(repo_uri, str(HERE / "agent_code"))
+    if args.image:
+        from infra import image_copy
+        image_uri = image_copy.copy(args.image, repo_uri)
+    else:
+        image_uri = runtime_deploy.build_and_push(repo_uri, str(HERE / "agent_code"))
     runtime_arn = runtime_deploy.deploy_runtime(image_uri, role_arn, {
         "PARAM_PREFIX": prefix,
         "AWS_REGION": boto3.Session().region_name or "us-east-1"})
